@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Retrieve and cache GitHub repository preview information."""
+"""Retrieve and cache GitHub repository preview information with daily logs."""
 
 import json
 import os
@@ -15,6 +15,7 @@ GITHUB_USER_REPOS_URL = "https://api.github.com/users/{username}/repos"
 GITHUB_TRAFFIC_VIEWS_URL = "https://api.github.com/repos/{owner}/{repo}/traffic/views"
 GITHUB_TRAFFIC_CLONES_URL = "https://api.github.com/repos/{owner}/{repo}/traffic/clones"
 DATA_DIR = Path("github_data")
+LOGS_DIR = Path("logs")
 
 
 def get_token() -> str:
@@ -181,6 +182,98 @@ def save_user_repos(username: str, repos: list[dict], with_traffic: bool = False
     return filepath
 
 
+# ---------------------------------------------------------------------------
+# Daily logging helpers
+# ---------------------------------------------------------------------------
+
+
+def log_path(owner: str, repo: str, date: str | None = None) -> Path:
+    """Return the daily log file path for a repository."""
+    if date is None:
+        date = datetime.now(timezone.utc).date().isoformat()
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    return LOGS_DIR / f"{owner}_{repo}_{date}.json"
+
+
+def log_values(data: dict) -> dict:
+    """Extract the values we track over time from a repository response."""
+    traffic = data.get("_traffic", {})
+    values = {
+        "stars": data.get("stargazers_count"),
+        "forks": data.get("forks_count"),
+        "open_issues": data.get("open_issues_count"),
+        "watchers": data.get("watchers_count"),
+        "subscribers": data.get("subscribers_count"),
+    }
+
+    if traffic.get("views_accessible"):
+        views = traffic.get("views", {})
+        values["views_count"] = views.get("count")
+        values["views_uniques"] = views.get("uniques")
+    else:
+        values["views_count"] = None
+        values["views_uniques"] = None
+
+    if traffic.get("clones_accessible"):
+        clones = traffic.get("clones", {})
+        values["clones_count"] = clones.get("count")
+        values["clones_uniques"] = clones.get("uniques")
+    else:
+        values["clones_count"] = None
+        values["clones_uniques"] = None
+
+    return values
+
+
+def build_log_record(owner: str, repo: str, data: dict) -> dict:
+    """Build a daily log record for a repository."""
+    return {
+        "owner": owner,
+        "repo": repo,
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "values": log_values(data),
+        "data": data,
+    }
+
+
+def values_changed(old_record: dict, new_record: dict) -> bool:
+    """Compare tracked values between two log records."""
+    old_values = old_record.get("values", {})
+    new_values = new_record.get("values", {})
+    return old_values != new_values
+
+
+def save_daily_log(owner: str, repo: str, data: dict) -> tuple[Path, str]:
+    """
+    Save or update the daily log for a repository.
+
+    Returns the log file path and a status string:
+    - "created" if a new log was written
+    - "updated" if the values changed and the log was overwritten
+    - "unchanged" if the values are the same as the existing log
+    """
+    path = log_path(owner, repo)
+    new_record = build_log_record(owner, repo, data)
+
+    if path.exists():
+        old_record = json.loads(path.read_text(encoding="utf-8"))
+        if not values_changed(old_record, new_record):
+            return path, "unchanged"
+
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(new_record, f, indent=2)
+
+    if path.exists() and "old_record" in dir():
+        return path, "updated"
+    return path, "created"
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+
 def print_preview(data: dict) -> None:
     """Print a concise preview of the repository."""
     traffic = data.get("_traffic", {})
@@ -249,31 +342,112 @@ def print_user_preview(username: str, repos: list[dict], include_traffic: bool =
         print()
 
 
-def parse_args(argv: list[str]) -> tuple[str, bool, bool]:
+def list_log_files() -> list[Path]:
+    """Return all repository daily log files sorted by name."""
+    if not LOGS_DIR.exists():
+        return []
+    return sorted(LOGS_DIR.glob("*.json"))
+
+
+def print_logs_preview() -> None:
+    """Read all saved daily logs and print a preview for each one."""
+    log_files = list_log_files()
+
+    if not log_files:
+        print("No daily log files found in 'logs/'.")
+        return
+
+    print(f"Found {len(log_files)} daily log file(s)")
+    print("=" * 60)
+
+    for path in log_files:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"\nCould not read {path}: {exc}")
+            continue
+
+        data = record.get("data", {})
+        date = record.get("date", "unknown")
+        fetched_at = record.get("fetched_at", "unknown")
+
+        print(f"\nLog file: {path.name}")
+        print(f"Date:     {date}")
+        print(f"Saved at: {fetched_at}")
+        print_preview(data)
+
+
+# ---------------------------------------------------------------------------
+# Command-line parsing and main entry point
+# ---------------------------------------------------------------------------
+
+
+def print_help() -> None:
+    """Print usage instructions and available options."""
+    print("github_repo_preview.py - Fetch GitHub repository info and keep daily logs")
+    print()
+    print("Usage:")
+    print("  python github_repo_preview.py <owner/repo>")
+    print("  python github_repo_preview.py <username>")
+    print("  python github_repo_preview.py me")
+    print("  python github_repo_preview.py me --with-traffic")
+    print("  python github_repo_preview.py --list-logs")
+    print("  python github_repo_preview.py --help | -h")
+    print()
+    print("Examples:")
+    print("  python github_repo_preview.py torvalds/linux")
+    print("  python github_repo_preview.py m5it")
+    print("  export GITHUB_TOKEN=ghp_xxx && python github_repo_preview.py me --with-traffic")
+    print()
+    print("Options:")
+    print("  --with-traffic   Include owner-only traffic data (views/clones, 14 days)")
+    print("  --list-logs      Read and preview all saved daily log files")
+    print("  --help, -h       Show this help message")
+    print()
+    print("Environment:")
+    print("  GITHUB_TOKEN     GitHub personal access token (required for API access)")
+    print()
+    print("Output:")
+    print("  github_data/     Raw API responses with timestamps")
+    print("  logs/            Daily per-repository JSON logs (updated only when values change)")
+
+
+def parse_args(argv: list[str]) -> tuple[str | None, bool, bool, bool]:
     """
     Parse command-line arguments.
 
-    Returns a tuple of (target, is_username, with_traffic).
-    - owner/repo format -> specific repo
-    - username only     -> all public repos for that user
-    - --with-traffic    -> include views/clones for each repo (owner-only)
+    Returns a tuple of (target, is_username, with_traffic, list_logs).
+    - owner/repo format   -> specific repo
+    - username only       -> all public repos for that user
+    - me                  -> all repos for the authenticated user
+    - --with-traffic      -> include views/clones for each repo (owner-only)
+    - --list-logs         -> list and preview all saved daily logs
     """
+    if len(argv) == 2 and argv[1] in ("--help", "-h"):
+        print_help()
+        sys.exit(0)
+
     if len(argv) < 2 or len(argv) > 3:
-        print("Usage: python github_repo_preview.py <owner/repo>")
-        print("       python github_repo_preview.py <username>")
-        print("       python github_repo_preview.py <username> --with-traffic")
+        print_help()
         sys.exit(1)
+
+    if "--list-logs" in argv:
+        return None, False, False, True
 
     target = argv[1]
     with_traffic = "--with-traffic" in argv
 
     if "/" in target:
-        return target, False, with_traffic
-    return target, True, with_traffic
+        return target, False, with_traffic, False
+    return target, True, with_traffic, False
 
 
 def main() -> None:
-    target, is_username, with_traffic = parse_args(sys.argv)
+    target, is_username, with_traffic, list_logs = parse_args(sys.argv)
+
+    if list_logs:
+        print_logs_preview()
+        return
 
     token = get_token()
 
@@ -291,6 +465,21 @@ def main() -> None:
         filepath = save_user_repos(username, repos, with_traffic=with_traffic)
 
         print(f"Saved list of {len(repos)} repositories to: {filepath}")
+
+        for repo_info in sorted(repos, key=lambda r: r.get("name", "")):
+            owner, name = repo_info.get("full_name", "/").split("/", 1)
+            try:
+                if with_traffic:
+                    data = fetch_repo_with_traffic(owner, name, token)
+                else:
+                    data = repo_info.copy()
+                    data["_traffic"] = {"views_accessible": False, "views": None, "clones_accessible": False, "clones": None}
+
+                log_file, status = save_daily_log(owner, name, data)
+                print(f"  Daily log for {owner}/{name}: {status} ({log_file.name})")
+            except requests.exceptions.RequestException as exc:
+                print(f"  Could not create log for {owner}/{name}: {exc}")
+
         print_user_preview(username, repos, include_traffic=with_traffic, token=token)
     else:
         owner, repo = target.split("/", 1)
@@ -298,11 +487,20 @@ def main() -> None:
 
         data = fetch_repo_with_traffic(owner, repo, token)
         filepath = save_repo_info(owner, repo, data)
+        log_file, status = save_daily_log(owner, repo, data)
 
         print(f"Data saved to: {filepath}")
+        print(f"Daily log: {log_file.name} ({status})")
         print()
         print_preview(data)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except requests.exceptions.RequestException as exc:
+        print(f"Network error: {exc}", file=sys.stderr)
+        sys.exit(1)
