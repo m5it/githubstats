@@ -27,8 +27,11 @@ keeps a daily log of repository values.
    # Include owner-only traffic data (views/clones for the last 14 days)
    python3 github_repo_preview.py me --with-traffic
 
-   # List and preview all saved daily logs
+   # List and preview all saved daily logs (one line per repo)
    python3 github_repo_preview.py --list-logs
+
+   # List and preview logs for a single repo
+   python3 github_repo_preview.py --list-logs owner/repo
    ```
 
 ## Output

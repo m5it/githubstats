@@ -308,7 +308,7 @@ def print_preview(data: dict) -> None:
             print("Clones:          not accessible (token must have repo owner/push access)")
 
 
-def print_user_preview(username: str, repos: list[dict], include_traffic: bool = False, token: str | None = None) -> None:
+def print_user_preview(username: str, repos: list[dict], include_traffic: bool = False, token: str | None = None, traffic_cache: dict | None = None) -> None:
     """Print a concise preview of all repositories for a user."""
     private_count = sum(1 for r in repos if r.get("private"))
 
@@ -326,18 +326,24 @@ def print_user_preview(username: str, repos: list[dict], include_traffic: bool =
         print(f"  Forks:       {repo.get('forks_count')}")
         print(f"  Language:    {repo.get('language')}")
 
-        if include_traffic and token:
-            try:
-                data = fetch_repo_with_traffic(owner, name, token)
-                traffic = data.get("_traffic", {})
-                if traffic.get("views_accessible"):
-                    views = traffic.get("views", {})
-                    print(f"  Views (14d): count={views.get('count')}, uniques={views.get('uniques')}")
-                if traffic.get("clones_accessible"):
-                    clones = traffic.get("clones", {})
-                    print(f"  Clones (14d): count={clones.get('count')}, uniques={clones.get('uniques')}")
-            except requests.exceptions.RequestException:
-                print("  Traffic:     not available")
+        if include_traffic:
+            if traffic_cache and repo.get("full_name") in traffic_cache:
+                traffic = traffic_cache[repo["full_name"]]
+            elif token:
+                try:
+                    data = fetch_repo_with_traffic(owner, name, token)
+                    traffic = data.get("_traffic", {})
+                except requests.exceptions.RequestException:
+                    print("  Traffic:     not available")
+                    traffic = {}
+            else:
+                traffic = {}
+            if traffic.get("views_accessible"):
+                views = traffic.get("views", {})
+                print(f"  Views (14d): count={views.get('count')}, uniques={views.get('uniques')}")
+            if traffic.get("clones_accessible"):
+                clones = traffic.get("clones", {})
+                print(f"  Clones (14d): count={clones.get('count')}, uniques={clones.get('uniques')}")
 
         print()
 
@@ -349,32 +355,119 @@ def list_log_files() -> list[Path]:
     return sorted(LOGS_DIR.glob("*.json"))
 
 
-def print_logs_preview() -> None:
-    """Read all saved daily logs and print a preview for each one."""
+def _deduplicate_log_files(log_files: list[Path]) -> list[Path]:
+    """Deduplicate log files by repo, keeping the newest dated entry per repo."""
+    import re as _re
+
+    latest: dict[str, Path] = {}
+    date_pattern = _re.compile(r"_(\d{4}-\d{2}-\d{2})\.json$")
+    for path in log_files:
+        m = date_pattern.search(path.name)
+        date_str = m.group(1) if m else ""
+        repo_key = path.name[: m.start()] if m else path.stem
+        if repo_key not in latest or date_str > date_pattern.search(latest[repo_key].name).group(1):
+            latest[repo_key] = path
+
+    return sorted(latest.values(), key=lambda p: p.name.lower())
+
+
+def _load_log_entries(log_files: list[Path]) -> list[dict]:
+    """Load log records from files, skipping unreadable ones."""
+    entries: list[dict] = []
+    for path in log_files:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"Could not read {path}: {exc}", file=sys.stderr)
+            continue
+        entries.append(record)
+    return entries
+
+
+def print_logs_preview(
+    filter_repo: str | None = None,
+    full: bool = False,
+    sort_by: str | None = None,
+) -> None:
+    """Read saved daily logs and print a preview for each repo.
+
+    If filter_repo is set (e.g. "owner/repo"), only that repository is shown.
+    When multiple dated logs exist for the same repo only the newest entry is
+    kept. Output is one line per repo unless full is enabled.
+    sort_by can be: views, clones, stars, forks.
+    """
+    import re as _re
+
     log_files = list_log_files()
+
+    if filter_repo:
+        escaped = _re.escape(filter_repo.replace("/", "_"))
+        pattern = _re.compile(rf"^{escaped}_\d{{4}}-\d{{2}}-\d{{2}}\.json$")
+        log_files = [p for p in log_files if pattern.match(p.name)]
+        if not log_files:
+            print(f"No daily log files found for '{filter_repo}' in 'logs/'.")
+            return
 
     if not log_files:
         print("No daily log files found in 'logs/'.")
         return
 
-    print(f"Found {len(log_files)} daily log file(s)")
-    print("=" * 60)
+    log_files = _deduplicate_log_files(log_files)
+    entries = _load_log_entries(log_files)
 
-    for path in log_files:
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            print(f"\nCould not read {path}: {exc}")
-            continue
+    if not entries:
+        print("No readable log files found.")
+        return
 
+    # Sorting: highest values first. Default is alphabetical.
+    if sort_by in ("views", "clones", "stars", "forks"):
+        sort_key_map = {
+            "views": "views_count",
+            "clones": "clones_count",
+            "stars": "stars",
+            "forks": "forks",
+        }
+        key = sort_key_map[sort_by]
+        entries.sort(key=lambda r: r.get("values", {}).get(key) or 0, reverse=True)
+    else:
+        entries.sort(key=lambda r: r.get("data", {}).get("full_name", "").lower())
+
+    # Auto-enable full preview when filtering to a single repo.
+    if filter_repo and len(entries) == 1 and not full:
+        full = True
+
+    if full:
+        for record in entries:
+            data = record.get("data", {})
+            print(f"Log file: {record.get('owner')}_{record.get('repo')}_{record.get('date')}.json")
+            print(f"Date:     {record.get('date')}")
+            print(f"Saved at: {record.get('fetched_at')}")
+            print_preview(data)
+            print()
+        return
+
+    print(f"Found {len(entries)} repository log(s)")
+    print("-" * 70)
+    print(f"{'repo':<42} {'views':>8} {'views_u':>8} | {'clones':>8} {'clones_u':>8}")
+    print("-" * 70)
+
+    for record in entries:
+        values = record.get("values", {})
         data = record.get("data", {})
-        date = record.get("date", "unknown")
-        fetched_at = record.get("fetched_at", "unknown")
+        full_name = data.get("full_name") or f"{record.get('owner')}/{record.get('repo')}"
 
-        print(f"\nLog file: {path.name}")
-        print(f"Date:     {date}")
-        print(f"Saved at: {fetched_at}")
-        print_preview(data)
+        views = values.get("views_count")
+        views_u = values.get("views_uniques")
+        clones = values.get("clones_count")
+        clones_u = values.get("clones_uniques")
+
+        vc = str(views) if views is not None else "-"
+        vu = str(views_u) if views_u is not None else "-"
+        cc = str(clones) if clones is not None else "-"
+        cu = str(clones_u) if clones_u is not None else "-"
+
+        date = record.get("date", "")
+        print(f"{full_name:<42} {vc:>8} {vu:>8} | {cc:>8} {cu:>8}   {date}")
 
 
 # ---------------------------------------------------------------------------
@@ -391,18 +484,25 @@ def print_help() -> None:
     print("  python github_repo_preview.py <username>")
     print("  python github_repo_preview.py me")
     print("  python github_repo_preview.py me --with-traffic")
-    print("  python github_repo_preview.py --list-logs")
+    print("  python github_repo_preview.py --list-logs [options]")
     print("  python github_repo_preview.py --help | -h")
     print()
     print("Examples:")
     print("  python github_repo_preview.py torvalds/linux")
     print("  python github_repo_preview.py m5it")
+    print("  python github_repo_preview.py --list-logs")
+    print("  python github_repo_preview.py --list-logs m5it/AIIA")
+    print("  python github_repo_preview.py --list-logs --full m5it/tsunamiwall")
+    print("  python github_repo_preview.py --list-logs --sort views")
+    print("  python github_repo_preview.py --list-logs --full --sort clones")
     print("  export GITHUB_TOKEN=ghp_xxx && python github_repo_preview.py me --with-traffic")
     print()
     print("Options:")
-    print("  --with-traffic   Include owner-only traffic data (views/clones, 14 days)")
-    print("  --list-logs      Read and preview all saved daily log files")
-    print("  --help, -h       Show this help message")
+    print("  --with-traffic       Include owner-only traffic data (views/clones, 14 days)")
+    print("  --list-logs          Read and preview all saved daily log files (one line per repo)")
+    print("  --full               With --list-logs: show full repository preview")
+    print("  --sort <field>       With --list-logs: sort by views, clones, stars, or forks")
+    print("  --help, -h           Show this help message")
     print()
     print("Environment:")
     print("  GITHUB_TOKEN     GitHub personal access token (required for API access)")
@@ -412,41 +512,78 @@ def print_help() -> None:
     print("  logs/            Daily per-repository JSON logs (updated only when values change)")
 
 
-def parse_args(argv: list[str]) -> tuple[str | None, bool, bool, bool]:
+def parse_args(argv: list[str]) -> tuple[str | None, bool, bool, bool, dict]:
     """
     Parse command-line arguments.
 
-    Returns a tuple of (target, is_username, with_traffic, list_logs).
+    Returns a tuple of (target, is_username, with_traffic, list_logs, list_logs_opts).
     - owner/repo format   -> specific repo
     - username only       -> all public repos for that user
     - me                  -> all repos for the authenticated user
     - --with-traffic      -> include views/clones for each repo (owner-only)
     - --list-logs         -> list and preview all saved daily logs
+    - --full              -> with --list-logs show full preview
+    - --sort <field>      -> with --list-logs sort by views, clones, stars, or forks
     """
     if len(argv) == 2 and argv[1] in ("--help", "-h"):
         print_help()
         sys.exit(0)
 
-    if len(argv) < 2 or len(argv) > 3:
+    if len(argv) < 2:
         print_help()
         sys.exit(1)
 
     if "--list-logs" in argv:
-        return None, False, False, True
+        idx = argv.index("--list-logs")
+        remaining = argv[idx + 1 :]
+        list_opts: dict[str, str | bool] = {}
+
+        if "--full" in remaining:
+            list_opts["full"] = True
+            remaining = [a for a in remaining if a != "--full"]
+
+        if "--sort" in remaining:
+            sort_idx = remaining.index("--sort")
+            if sort_idx + 1 < len(remaining):
+                sort_field = remaining[sort_idx + 1]
+                if sort_field in ("views", "clones", "stars", "forks"):
+                    list_opts["sort_by"] = sort_field
+                else:
+                    print(f"Error: --sort expects one of: views, clones, stars, forks (got '{sort_field}')", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                print("Error: --sort requires a field (views, clones, stars, forks)", file=sys.stderr)
+                sys.exit(1)
+
+        # Remaining non-flag arguments after --list-logs are repo filters.
+        filter_repo = None
+        for arg in remaining:
+            if arg.startswith("-"):
+                continue
+            if "/" in arg:
+                filter_repo = arg
+                break
+
+        return filter_repo, False, False, True, list_opts
 
     target = argv[1]
     with_traffic = "--with-traffic" in argv
 
     if "/" in target:
-        return target, False, with_traffic, False
-    return target, True, with_traffic, False
+        return target, False, with_traffic, False, {}
+    return target, True, with_traffic, False, {}
 
 
 def main() -> None:
-    target, is_username, with_traffic, list_logs = parse_args(sys.argv)
+    target, is_username, with_traffic, list_logs, list_opts = parse_args(sys.argv)
 
     if list_logs:
-        print_logs_preview()
+        # target carries optional repo filter for --list-logs (e.g. "owner/repo")
+        print_logs_preview(
+            filter_repo=target,
+            full=bool(list_opts.get("full")),
+            sort_by=list_opts.get("sort_by"),
+        )
         return
 
     token = get_token()
@@ -466,11 +603,14 @@ def main() -> None:
 
         print(f"Saved list of {len(repos)} repositories to: {filepath}")
 
+        # Fetch traffic once per repo and keep it for both logging and preview.
+        traffic_cache: dict[str, dict] = {}
         for repo_info in sorted(repos, key=lambda r: r.get("name", "")):
             owner, name = repo_info.get("full_name", "/").split("/", 1)
             try:
                 if with_traffic:
                     data = fetch_repo_with_traffic(owner, name, token)
+                    traffic_cache[repo_info["full_name"]] = data.get("_traffic", {})
                 else:
                     data = repo_info.copy()
                     data["_traffic"] = {"views_accessible": False, "views": None, "clones_accessible": False, "clones": None}
@@ -480,7 +620,7 @@ def main() -> None:
             except requests.exceptions.RequestException as exc:
                 print(f"  Could not create log for {owner}/{name}: {exc}")
 
-        print_user_preview(username, repos, include_traffic=with_traffic, token=token)
+        print_user_preview(username, repos, include_traffic=with_traffic, traffic_cache=traffic_cache)
     else:
         owner, repo = target.split("/", 1)
         print(f"Fetching repository info for {owner}/{repo}...")
