@@ -355,20 +355,45 @@ def list_log_files() -> list[Path]:
     return sorted(LOGS_DIR.glob("*.json"))
 
 
-def _deduplicate_log_files(log_files: list[Path]) -> list[Path]:
-    """Deduplicate log files by repo, keeping the newest dated entry per repo."""
+def _group_log_files_by_repo(log_files: list[Path]) -> dict[str, list[Path]]:
+    """Group log files by repo key, each group's entries sorted newest first."""
     import re as _re
 
-    latest: dict[str, Path] = {}
+    groups: dict[str, list[Path]] = {}
     date_pattern = _re.compile(r"_(\d{4}-\d{2}-\d{2})\.json$")
     for path in log_files:
         m = date_pattern.search(path.name)
-        date_str = m.group(1) if m else ""
         repo_key = path.name[: m.start()] if m else path.stem
-        if repo_key not in latest or date_str > date_pattern.search(latest[repo_key].name).group(1):
-            latest[repo_key] = path
+        groups.setdefault(repo_key, []).append(path)
 
-    return sorted(latest.values(), key=lambda p: p.name.lower())
+    for paths in groups.values():
+        paths.sort(
+            key=lambda p: date_pattern.search(p.name).group(1) if date_pattern.search(p.name) else "",
+            reverse=True,
+        )
+
+    return groups
+
+
+def _deduplicate_log_files(log_files: list[Path]) -> list[Path]:
+    """Deduplicate log files by repo, keeping the newest dated entry per repo."""
+    groups = _group_log_files_by_repo(log_files)
+    return sorted([paths[0] for paths in groups.values()], key=lambda p: p.name.lower())
+
+
+def _compute_value_changes(old_values: dict, new_values: dict) -> dict[str, int]:
+    """Compute numeric deltas between two values dicts. Missing values are treated as 0."""
+    changes: dict[str, int] = {}
+    all_keys = set(old_values.keys()) | set(new_values.keys())
+    for key in all_keys:
+        old_val = old_values.get(key)
+        new_val = new_values.get(key)
+        if old_val is None or new_val is None:
+            continue
+        delta = new_val - old_val
+        if delta != 0:
+            changes[key] = delta
+    return changes
 
 
 def _load_log_entries(log_files: list[Path]) -> list[dict]:
@@ -382,6 +407,106 @@ def _load_log_entries(log_files: list[Path]) -> list[dict]:
             continue
         entries.append(record)
     return entries
+
+
+def print_logs_changes(filter_repo: str | None = None, sort_by: str | None = None) -> None:
+    """Compare the newest log entry per repo with the previous dated one and preview deltas.
+
+    Only repos with at least two dated logs are considered. If filter_repo is set,
+    only that repo is checked.
+    """
+    import re as _re
+
+    log_files = list_log_files()
+
+    if filter_repo:
+        escaped = _re.escape(filter_repo.replace("/", "_"))
+        pattern = _re.compile(rf"^{escaped}_\d{{4}}-\d{{2}}-\d{{2}}\.json$")
+        log_files = [p for p in log_files if pattern.match(p.name)]
+        if not log_files:
+            print(f"No daily log files found for '{filter_repo}' in 'logs/'.")
+            return
+
+    if not log_files:
+        print("No daily log files found in 'logs/'.")
+        return
+
+    groups = _group_log_files_by_repo(log_files)
+
+    # Build comparison entries: latest vs previous date per repo.
+    compared: list[dict] = []
+    for repo_key, paths in sorted(groups.items()):
+        entries = _load_log_entries(paths)
+        if len(entries) < 2:
+            continue
+        records_by_date: dict[str, dict] = {e.get("date", ""): e for e in entries}
+        dates = sorted(records_by_date, reverse=True)
+        latest = records_by_date[dates[0]]
+        previous = records_by_date[dates[1]]
+        changes = _compute_value_changes(previous.get("values", {}), latest.get("values", {}))
+        full_name = latest.get("data", {}).get("full_name") or f"{latest.get('owner')}/{latest.get('repo')}"
+        compared.append(
+            {
+                "full_name": full_name,
+                "from_date": dates[1],
+                "to_date": dates[0],
+                "changes": changes,
+                "latest_values": latest.get("values", {}),
+            }
+        )
+
+    if not compared and filter_repo:
+        print(f"Not enough history to compare for '{filter_repo}' (need at least two dated logs).")
+        return
+    if not compared:
+        print("Not enough history to compare (need at least two dated logs per repo).")
+        return
+
+    if sort_by in ("views", "clones", "stars", "forks"):
+        sort_key_map = {"views": "views_count", "clones": "clones_count", "stars": "stars", "forks": "forks"}
+        key = sort_key_map[sort_by]
+        compared.sort(key=lambda e: abs(e["changes"].get(key, 0)) if key in e["changes"] else -1, reverse=True)
+    else:
+        compared.sort(key=lambda e: e["full_name"].lower())
+
+    print(f"Found {len(compared)} repository log(s) with history ({sum(1 for c in compared if c['changes'])} with changes)")
+    print("-" * 80)
+    print(f"{'repo':<42} {'views':>8} {'views_u':>8} | {'clones':>8} {'clones_u':>8}   range")
+    print("-" * 80)
+
+    for entry in compared:
+        changes = entry["changes"]
+        vals = entry["latest_values"]
+        vc = vals.get("views_count")
+        vu = vals.get("views_uniques")
+        cc = vals.get("clones_count")
+        cu = vals.get("clones_uniques")
+
+        def fmt_with_delta(v: int | None, delta_key: str) -> str:
+            if v is None:
+                return "-"
+            if delta_key not in changes:
+                return str(v)
+            d = changes[delta_key]
+            sign = "+" if d > 0 else ""
+            return f"{v} ({sign}{d})"
+
+        vc_s = fmt_with_delta(vc, "views_count")
+        vu_s = fmt_with_delta(vu, "views_uniques")
+        cc_s = fmt_with_delta(cc, "clones_count")
+        cu_s = fmt_with_delta(cu, "clones_uniques")
+        date_range = f"{entry['from_date']} -> {entry['to_date']}"
+
+        if not changes:
+            print(f"{entry['full_name']:<42} {vc_s:>8} {vu_s:>8} | {cc_s:>8} {cu_s:>8}   {date_range}")
+        else:
+            # Highlight changed repos with a leading marker.
+            change_summary = ", ".join(f"{k} {d:+d}" for k, d in sorted(changes.items()))
+            print(f"*{entry['full_name']:<41} {vc_s:>8} {vu_s:>8} | {cc_s:>8} {cu_s:>8}   {date_range}")
+            print(f"  └ changes: {change_summary}")
+
+    print("-" * 80)
+    print("Rows marked * have changes since the previous dated log.")
 
 
 def print_logs_preview(
@@ -495,6 +620,8 @@ def print_help() -> None:
     print("  python github_repo_preview.py --list-logs --full m5it/tsunamiwall")
     print("  python github_repo_preview.py --list-logs --sort views")
     print("  python github_repo_preview.py --list-logs --full --sort clones")
+    print("  python github_repo_preview.py --list-logs --changes")
+    print("  python github_repo_preview.py --list-logs --changes --sort clones")
     print("  export GITHUB_TOKEN=ghp_xxx && python github_repo_preview.py me --with-traffic")
     print()
     print("Options:")
@@ -502,6 +629,7 @@ def print_help() -> None:
     print("  --list-logs          Read and preview all saved daily log files (one line per repo)")
     print("  --full               With --list-logs: show full repository preview")
     print("  --sort <field>       With --list-logs: sort by views, clones, stars, or forks")
+    print("  --changes            With --list-logs: compare last two dated logs and show changes")
     print("  --help, -h           Show this help message")
     print()
     print("Environment:")
@@ -524,6 +652,7 @@ def parse_args(argv: list[str]) -> tuple[str | None, bool, bool, bool, dict]:
     - --list-logs         -> list and preview all saved daily logs
     - --full              -> with --list-logs show full preview
     - --sort <field>      -> with --list-logs sort by views, clones, stars, or forks
+    - --changes           -> with --list-logs compare last two dated logs per repo
     """
     if len(argv) == 2 and argv[1] in ("--help", "-h"):
         print_help()
@@ -541,6 +670,10 @@ def parse_args(argv: list[str]) -> tuple[str | None, bool, bool, bool, dict]:
         if "--full" in remaining:
             list_opts["full"] = True
             remaining = [a for a in remaining if a != "--full"]
+
+        if "--changes" in remaining:
+            list_opts["changes"] = True
+            remaining = [a for a in remaining if a != "--changes"]
 
         if "--sort" in remaining:
             sort_idx = remaining.index("--sort")
@@ -578,7 +711,10 @@ def main() -> None:
     target, is_username, with_traffic, list_logs, list_opts = parse_args(sys.argv)
 
     if list_logs:
-        # target carries optional repo filter for --list-logs (e.g. "owner/repo")
+        # --list-logs variants go here; target carries optional repo filter.
+        if list_opts.get("changes"):
+            print_logs_changes(filter_repo=target, sort_by=list_opts.get("sort_by"))
+            return
         print_logs_preview(
             filter_repo=target,
             full=bool(list_opts.get("full")),
